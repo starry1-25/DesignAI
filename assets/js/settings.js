@@ -63,8 +63,8 @@
   async function loadHealth() {
     const live = $('#svcLive');
 
-    // 静态托管没有后端：不探测，直接呈现"静态预览"
-    if (!ui.hasLocalBackend()) {
+    // 完全没有可用后端时：不探测，直接说明
+    if (!ui.hasBackend()) {
       live.classList.remove('is-off');
       live.classList.add('is-warn');
       live.innerHTML = '<i aria-hidden="true"></i> 静态预览';
@@ -108,7 +108,7 @@
 
   /* -------------------------------------------------------------- 数据统计 */
   async function loadData() {
-    if (!ui.hasLocalBackend()) { $('#dataCount').textContent = '—'; return; }
+    if (!ui.hasBackend()) { $('#dataCount').textContent = '—'; return; }
     try {
       const d = await api.history();
       const n = (d.records || []).length;
@@ -127,7 +127,7 @@
     loadPrefs();
 
     // 岗位列表优先取服务端（静态托管下没有后端，直接用内置列表）
-    if (ui.hasLocalBackend()) {
+    if (ui.hasBackend()) {
       api.roles().then((d) => {
         if (d && d.roles && d.roles.length) roles = d.roles;
         renderPrefs();

@@ -146,13 +146,26 @@
   }
 
   /* ------------------------------------------------------------- 运行环境判定
-     只有经由本地 server.ps1 打开时才有后端。部署到 GitHub Pages 等静态托管时
-     没有后端，此时若仍去请求 /api/* 必然 404，还会弹出"请运行 server.ps1"这种
-     在线上完全不成立的提示。因此先判定环境，再决定是探测还是如实说明。 */
+     两种后端形态：
+     1) 本机经 server.ps1 打开 → 同源相对路径，最高优先级
+     2) 部署到 GitHub Pages 等静态托管 → 走远端的 Vercel 后端（与 PUA 同构）
+     密钥始终只存在后端，前端任何时候都不直接请求第三方模型接口。 */
+  const REMOTE_API = 'https://designai-api.vercel.app';
+
   function hasLocalBackend() {
     if (location.protocol === 'file:') return false;
     const h = location.hostname;
     return h === 'localhost' || h === '127.0.0.1' || h === '::1';
+  }
+
+  // 请求前缀：本机用同源，静态托管用远端后端
+  function apiBase() {
+    return hasLocalBackend() ? '' : REMOTE_API;
+  }
+
+  // 是否具备可用的 AI 后端（本机或远端）
+  function hasBackend() {
+    return hasLocalBackend() || !!REMOTE_API;
   }
 
   const STATIC_NOTICE =
@@ -199,7 +212,7 @@
   async function pingServer() {
     if (location.protocol === 'file:') return false;
     // 静态托管（GitHub Pages 等）没有后端，不必也不该发探测请求
-    if (!hasLocalBackend()) return false;
+    if (!hasBackend()) return false;
     for (let i = 0; i < 3; i++) {
       try {
         await HZ.api.health(4000);
@@ -218,7 +231,7 @@
   HZ.ui = {
     mountIcons, esc, toast, copyText, download, fmtDate, debounce,
     initNav, guardOrigin, pingServer, offlineBar, clearOfflineBar,
-    onBackendUp, watchBackend,
+    onBackendUp, watchBackend, apiBase, hasBackend,
     hasLocalBackend, STATIC_NOTICE
   };
 })();

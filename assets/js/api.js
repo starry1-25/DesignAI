@@ -40,6 +40,14 @@
   // 「服务端未配密钥」属于部署侧问题，并非用户可自行解决，界面只做说明
   const SETUP_CODES = ['no_api_key'];
 
+  /* 请求前缀由 ui 决定：本机经 server.ps1 打开用同源，静态托管（GitHub Pages）
+     走远端 Vercel 后端。api.js 先于 ui.js 加载，因此推迟到真正发请求时再取值。 */
+  function apiUrl(path) {
+    const base = (window.HZ && window.HZ.ui && window.HZ.ui.apiBase)
+      ? window.HZ.ui.apiBase() : '';
+    return base + '/api' + path;
+  }
+
   function isSetupError(err) {
     return !!(err && SETUP_CODES.indexOf(err.code) >= 0);
   }
@@ -57,7 +65,7 @@
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), timeoutMs || TIMEOUT.short);
     try {
-      const res = await fetch('/api' + path, {
+      const res = await fetch(apiUrl(path), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body || {}),
@@ -87,7 +95,7 @@
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), timeoutMs || TIMEOUT.short);
     try {
-      const res = await fetch('/api' + path, { signal: ctrl.signal });
+      const res = await fetch(apiUrl(path), { signal: ctrl.signal });
       const data = await res.json().catch(() => null);
       if (!res.ok || !data) {
         const e = new Error('HTTP ' + res.status);
@@ -111,7 +119,7 @@
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), timeoutMs || TIMEOUT.short);
     try {
-      const res = await fetch('/api' + path, { method: 'DELETE', signal: ctrl.signal });
+      const res = await fetch(apiUrl(path), { method: 'DELETE', signal: ctrl.signal });
       const data = await res.json().catch(() => null);
       if (!res.ok || !data || data.ok === false) {
         const e = new Error((data && data.message) || ('HTTP ' + res.status));

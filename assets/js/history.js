@@ -197,8 +197,8 @@
 
   /* ------------------------------------------------------------------ 动作 */
   async function load() {
-    // 静态托管没有后端：不做 404 请求，直接说明
-    if (!ui.hasLocalBackend()) {
+    // 完全没有可用后端时：不做注定失败的请求，直接说明
+    if (!ui.hasBackend()) {
       records = [];
       $('#count').textContent = '静态预览部署';
       $('#list').innerHTML =

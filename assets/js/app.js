@@ -532,8 +532,8 @@
   async function generate() {
     if (state.busy) return;
 
-    // 静态部署没有后端，直接说明，不去发注定 404 的请求
-    if (!ui.hasLocalBackend()) {
+    // 完全没有可用后端时才直接说明，不去发注定失败的请求
+    if (!ui.hasBackend()) {
       renderStaticPanel();
       ui.toast('静态预览部署不含后端，无法生成视觉稿', 'err');
       scrollToResult();
@@ -676,7 +676,7 @@
   /* ------------------------------------------------------------------ 启动 */
   async function loadRoles() {
     // 静态托管下没有后端，直接用内置的兜底岗位表，避免发出必然 404 的请求
-    if (ui.hasLocalBackend()) {
+    if (ui.hasBackend()) {
       try {
         const data = await api.roles();
         if (data && data.roles && data.roles.length) {
@@ -700,7 +700,7 @@
   }
 
   async function restoreSession() {
-    if (!ui.hasLocalBackend()) return;   // 静态托管没有历史记录接口
+    if (!ui.hasBackend()) return;   // 静态托管没有历史记录接口
     const id = sessionStorage.getItem('hz.currentId');
     if (!id) return;
     try {
@@ -755,7 +755,7 @@
   async function refreshStatus() {
     // 静态托管（如 GitHub Pages）没有后端：不做注定失败的探测，直接如实说明。
     // 界面与交互此时依然完全可用，不受影响。
-    if (!ui.hasLocalBackend()) {
+    if (!ui.hasBackend()) {
       els.live.className = 'live is-warn';
       els.liveText.textContent = '静态预览模式';
       els.live.dataset.ready = '0';
