@@ -170,23 +170,55 @@
     return true;
   }
 
+  /* 后端在跑长任务时是单线程的，被占满的瞬间一次健康探测就会失败。
+     所以失败不能立刻下结论：先自动重试几次，仍然离线就定时复查，
+     服务恢复后自动撤掉提示条并回调各页面刷新状态，用户无需手动刷新。 */
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+  let probeTimer = null;
+  const recoverHandlers = [];
+
+  function onBackendUp(fn) {
+    if (typeof fn === 'function') recoverHandlers.push(fn);
+  }
+
+  function stopProbe() {
+    if (probeTimer) { clearInterval(probeTimer); probeTimer = null; }
+  }
+
+  function watchBackend() {
+    if (probeTimer) return;
+    probeTimer = setInterval(async () => {
+      try { await HZ.api.health(4000); } catch (_) { return; }   // 仍未恢复，继续等
+      stopProbe();
+      clearOfflineBar();
+      recoverHandlers.forEach((fn) => { try { fn(); } catch (_) {} });
+    }, 5000);
+  }
+
   async function pingServer() {
     if (location.protocol === 'file:') return false;
     // 静态托管（GitHub Pages 等）没有后端，不必也不该发探测请求
     if (!hasLocalBackend()) return false;
-    try {
-      await HZ.api.health();
-      clearOfflineBar();
-      return true;
-    } catch (_) {
-      offlineBar('本地服务未响应，请先运行 <strong>server.ps1</strong> 后再刷新页面。');
-      return false;
+    for (let i = 0; i < 3; i++) {
+      try {
+        await HZ.api.health(4000);
+        stopProbe();
+        clearOfflineBar();
+        return true;
+      } catch (_) {
+        if (i < 2) await sleep(1200);
+      }
     }
+    offlineBar('本地服务未响应，正在自动重试…（若长时间未恢复，请在本机运行 <strong>start.ps1</strong>）');
+    watchBackend();
+    return false;
   }
 
   HZ.ui = {
     mountIcons, esc, toast, copyText, download, fmtDate, debounce,
     initNav, guardOrigin, pingServer, offlineBar, clearOfflineBar,
+    onBackendUp, watchBackend,
     hasLocalBackend, STATIC_NOTICE
   };
 })();

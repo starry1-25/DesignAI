@@ -11,10 +11,30 @@
   let openedId = null;
 
   /* ------------------------------------------------------------------ 列表 */
+  /* 生成结果是整页 HTML，缩略图用一个被 transform 等比缩小的沙箱 iframe 直接渲染，
+     既保留真实视觉，也不必再落一张图片。 */
+  const BASE_W = 1600;
+
+  function frameBase(ratio) {
+    const p = String(ratio || '16:9').split(':');
+    const a = parseFloat(p[0]) || 16;
+    const b = parseFloat(p[1]) || 9;
+    const ar = a / b;
+    return ar >= 1
+      ? { w: BASE_W, h: Math.round(BASE_W / ar) }
+      : { w: Math.round(BASE_W * ar), h: BASE_W };
+  }
+
+  function thumbHTML(html, ratio) {
+    if (!html) return '<span class="ph">无预览</span>';
+    const base = frameBase(ratio);
+    return '<iframe class="thumb-frame" sandbox="" scrolling="no" tabindex="-1" aria-hidden="true" ' +
+      'data-bw="' + base.w + '" style="width:' + base.w + 'px;height:' + base.h + 'px" ' +
+      'srcdoc="' + ui.esc(html) + '"></iframe>';
+  }
+
   function cardHTML(r, latest) {
-    const thumb = r.imageUrl
-      ? '<img src="' + ui.esc(r.imageUrl) + '" alt="" loading="lazy">'
-      : '<span class="ph">无预览</span>';
+    const thumb = thumbHTML(r.html, r.ratio);
 
     const tags = (r.keywords || []).slice(0, 3)
       .map((k) => '<span class="tag">' + ui.esc(k) + '</span>').join('');
@@ -28,7 +48,7 @@
           '<div class="hist-title">' + ui.esc(r.title || '未命名视觉稿') + '</div>' +
           '<div class="hist-meta">' +
             '<span class="tag">' + ui.esc(r.roleName || '') + '</span>' +
-            '<span class="tag">' + ui.esc(r.ratio || '') + '</span>' +
+            '<span class="tag">' + ui.esc(r.size || 'AI 自动画幅') + '</span>' +
             '<span>' + ui.fmtDate(r.updatedAt || r.createdAt) + '</span>' +
             (vCount > 1 ? '<span>· ' + vCount + ' 个版本</span>' : '') +
           '</div>' +
@@ -67,6 +87,36 @@
       records.map((r, i) => cardHTML(r, i === 0)).join('') + '</div>';
     ui.mountIcons($('#list'));
     bindCards();
+    fitThumbs();
+  }
+
+  /* 缩略图按卡片宽度缩放。整页等比缩到卡片宽度后字会小到看不清，
+     因此再放大到卡片宽度的 2 倍并裁切，让缩略图能看清头部与指标卡。 */
+  function fitThumbs() {
+    document.querySelectorAll('.hist-thumb').forEach((th) => {
+      const f = th.querySelector('iframe');
+      if (!f) return;
+      const bw = parseFloat(f.dataset.bw) || BASE_W;
+      const w = th.clientWidth;
+      if (!w) return;
+      f.style.transform = 'scale(' + (w / bw) * 2 + ')';
+    });
+  }
+
+  /* 抽屉里的预览：等比缩放到抽屉宽度，过高时按高度上限收缩并水平居中 */
+  function fitDrawer() {
+    const box = $('#drawerFrame');
+    if (!box) return;
+    const f = box.querySelector('iframe');
+    if (!f) return;
+    const bw = parseFloat(f.dataset.bw) || BASE_W;
+    const bh = parseFloat(f.dataset.bh) || 900;
+    const w = box.clientWidth;
+    if (!w) return;
+    const s = Math.min(w / bw, 460 / bh);
+    box.style.height = Math.round(bh * s) + 'px';
+    f.style.transform = 'scale(' + s + ')';
+    f.style.left = Math.round((w - bw * s) / 2) + 'px';
   }
 
   function bindCards() {
@@ -102,17 +152,23 @@
 
     const revList = revs.map((v, i) =>
       '<div class="kv-row"><dt>第 ' + (i + 1) + ' 版</dt><dd>' +
-      ui.esc(v.ratio + ' · ' + (v.size || '') + ' · ' + ui.fmtDate(v.at)) + '</dd></div>').join('');
+      ui.esc((v.size || '') + ' · ' + ui.fmtDate(v.at)) + '</dd></div>').join('');
+
+    const base = frameBase(r.ratio);
+    const preview = r.html
+      ? '<div class="drawer-frame" id="drawerFrame">' +
+          '<iframe class="drawer-frame-inner" sandbox="" scrolling="no" tabindex="-1" ' +
+            'data-bw="' + base.w + '" data-bh="' + base.h + '" ' +
+            'style="width:' + base.w + 'px;height:' + base.h + 'px" ' +
+            'srcdoc="' + ui.esc(r.html) + '"></iframe>' +
+        '</div>'
+      : '<div class="drawer-img"><div class="empty" style="padding:44px 20px"><p>该记录还没有可用的页面</p></div></div>';
 
     $('#drawerBody').innerHTML =
-      '<div class="drawer-img">' +
-        (r.imageUrl
-          ? '<img src="' + ui.esc(r.imageUrl) + '" alt="视觉稿">'
-          : '<div class="empty" style="padding:44px 20px"><p>该记录没有可用图片</p></div>') +
-      '</div>' +
+      preview +
       '<dl class="kv">' +
         '<div class="kv-row"><dt>岗位</dt><dd>' + ui.esc(r.roleName || '') + '</dd></div>' +
-        '<div class="kv-row"><dt>比例</dt><dd>' + ui.esc(r.ratio || '') + '（' + ui.esc(r.size || '') + '）</dd></div>' +
+        '<div class="kv-row"><dt>画幅</dt><dd>AI 按需求自动适配（' + ui.esc(r.size || '') + '）</dd></div>' +
         '<div class="kv-row"><dt>创建</dt><dd>' + ui.esc(ui.fmtDate(r.createdAt)) + '</dd></div>' +
         '<div class="kv-row"><dt>原始需求</dt><dd>' + ui.esc(r.requirement || '') + '</dd></div>' +
         '<div class="kv-row"><dt>业务 Prompt</dt><dd>' + ui.esc(r.visiblePrompt || '') + '</dd></div>' +
@@ -124,6 +180,7 @@
     $('#mask').classList.add('is-open');
     $('#drawer').classList.add('is-open');
     $('#drawer').setAttribute('aria-hidden', 'false');
+    fitDrawer();
   }
 
   function closeDrawer() {
@@ -211,10 +268,13 @@
 
   function downloadOpened() {
     const r = find(openedId);
-    if (!r || !r.imageUrl) { ui.toast('暂无可下载的图片', 'err'); return; }
+    if (!r || !r.html) { ui.toast('暂无可下载的页面', 'err'); return; }
     const safe = (r.title || '视觉稿').replace(/[\\/:*?"<>|\s]+/g, '-').slice(0, 24);
-    ui.download(r.imageUrl, '绘职AI-' + (r.roleName || '') + '-' + safe + '.png');
-    ui.toast('已开始下载', 'ok');
+    const blob = new Blob([r.html], { type: 'text/html;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    ui.download(url, '绘职AI-' + (r.roleName || '') + '-' + safe + '.html');
+    setTimeout(() => URL.revokeObjectURL(url), 4000);
+    ui.toast('已开始下载 HTML 页面', 'ok');
   }
 
   /* ------------------------------------------------------------------ 启动 */
@@ -232,6 +292,9 @@
     $('#drawerDownload').addEventListener('click', downloadOpened);
     $('#drawerDelete').addEventListener('click', () => openedId && removeOne(openedId));
     document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeDrawer(); });
+
+    // 缩略图与抽屉预览都是按容器宽度缩放的，窗口尺寸变化后要重算
+    window.addEventListener('resize', () => { fitThumbs(); fitDrawer(); });
 
     load();
   }

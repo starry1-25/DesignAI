@@ -2,7 +2,7 @@
 #  HuiZhi AI  (HuiZhi)  -  Role-based Visual Agent  /  local backend
 #  Runtime : Windows PowerShell 5.1 + System.Net.HttpListener
 #  Purpose : static site host + Agnes AI gateway
-#            (chat planning, image generation, multi-turn refinement,
+#            (chat planning, HTML page generation, multi-turn refinement,
 #             history persistence)
 #
 #  Model service is fixed to Agnes AI (OpenAI-compatible). There is no
@@ -21,13 +21,12 @@ Add-Type -AssemblyName System.Security -ErrorAction SilentlyContinue
 # ---------------------------------------------------------------- paths & dirs
 $Root       = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
 $DataDir    = Join-Path $Root 'data'
-$ImgDir     = Join-Path $DataDir 'images'
 $LogDir     = Join-Path $Root 'logs'
 $RolesFile  = Join-Path $DataDir 'roles.json'
 $RecordFile = Join-Path $DataDir 'records.json'
 $EnvFile    = Join-Path $Root '.env'
 
-foreach ($d in @($DataDir, $ImgDir, $LogDir)) {
+foreach ($d in @($DataDir, $LogDir)) {
     if (-not (Test-Path $d)) { New-Item -ItemType Directory -Force -Path $d | Out-Null }
 }
 
@@ -74,21 +73,29 @@ function Get-Cfg {
 $script:ApiKey     = Get-Cfg 'AGNES_API_KEY' ''
 $script:BaseUrl    = Get-Cfg 'AGNES_BASE_URL' 'https://api.agnes-ai.cn/v1'
 $script:TextModel  = Get-Cfg 'AGNES_TEXT_MODEL' 'agnes-3.0-flash'
-$script:ImageModel = Get-Cfg 'AGNES_IMAGE_MODEL' 'agnes-image-2.5-flash'
-$script:ImageModelFallback = Get-Cfg 'AGNES_IMAGE_MODEL_FALLBACK' 'agnes-image-2.1-flash'
 $script:MaxTokens  = [int](Get-Cfg 'AGNES_MAX_TOKENS' '4096')
+# A generated page is far longer than a prompt, so the code stage gets its own
+# token budget. Reasoning models also spend tokens on reasoning_content first.
+$script:HtmlMaxTokens = [int](Get-Cfg 'AGNES_HTML_MAX_TOKENS' '12288')
 
 $script:Port      = [int](Get-Cfg 'PORT' '8230')
 $script:BindAll   = (Get-Cfg 'BIND_ALL' 'false') -eq 'true'
 
-# ratio -> upstream pixel size (verified: upstream honours the aspect exactly)
-$script:RatioSizes = @{
-    '1:1'  = '1024x1024'
-    '16:9' = '1280x720'
-    '9:16' = '720x1280'
-    '4:3'  = '1024x768'
+# ratio -> canvas the generated page must fill, in CSS pixels. The page is
+# rendered as live DOM (not a bitmap), so it stays vector-sharp at any size.
+$script:RatioCanvas = @{
+    '1:1'  = @{ label = '1200x1200'; w = 1200; h = 1200 }
+    '16:9' = @{ label = '1600x900';  w = 1600; h = 900 }
+    '9:16' = @{ label = '900x1600';  w = 900;  h = 1600 }
+    '4:3'  = @{ label = '1400x1050'; w = 1400; h = 1050 }
 }
 $script:Ratios = @('1:1', '16:9', '9:16', '4:3')
+
+function Get-Canvas {
+    param([string]$Ratio)
+    if ($script:RatioCanvas.ContainsKey($Ratio)) { return $script:RatioCanvas[$Ratio] }
+    return $script:RatioCanvas['1:1']
+}
 
 # baseUrl normalization: strip trailing slash before appending the path
 function Normalize-BaseUrl {
@@ -231,19 +238,39 @@ function Invoke-AgnesPost {
 
 # Agnes text completion. Returns a failure hash when the key is missing so the
 # UI can explain the situation instead of surfacing a raw transport error.
+# -System carries the site-wide design contract as a real system message, so it
+# is applied on top of every generation instead of being repeated by the caller.
 function Invoke-ChatCompletion {
-    param([string]$Prompt, [double]$Temperature = 1.0, [int]$TimeoutSec = 60)
+    param(
+        [string]$Prompt,
+        [string]$System = '',
+        [double]$Temperature = 1.0,
+        [int]$MaxTokens = 0,
+        [int]$MaxAttempts = 3,
+        [int]$TimeoutSec = 60
+    )
     if ([string]::IsNullOrWhiteSpace($script:ApiKey)) {
         return @{ ok = $false; status = 0; attempts = 0; ms = 0; msg = 'no_api_key' }
     }
 
+    $mt = if ($MaxTokens -gt 0) { $MaxTokens } else { $script:MaxTokens }
+    if (-not [string]::IsNullOrWhiteSpace($System)) {
+        $messages = @(
+            @{ role = 'system'; content = $System },
+            @{ role = 'user';   content = $Prompt }
+        )
+    }
+    else {
+        $messages = @(@{ role = 'user'; content = $Prompt })
+    }
+
     $payload = @{
         model       = $script:TextModel
-        messages    = @(@{ role = 'user'; content = $Prompt })
+        messages    = $messages
         temperature = $Temperature
-        max_tokens  = $script:MaxTokens
+        max_tokens  = $mt
     }
-    $r = Invoke-AgnesPost -Path '/chat/completions' -Payload $payload -MaxAttempts 3 -TimeoutSec $TimeoutSec
+    $r = Invoke-AgnesPost -Path '/chat/completions' -Payload $payload -MaxAttempts $MaxAttempts -TimeoutSec $TimeoutSec
     if (-not $r.ok) { return $r }
 
     $parsed = $null
@@ -257,6 +284,7 @@ function Invoke-ChatCompletion {
             Write-Log "CHAT reasoning_content fallback used model=$($script:TextModel)"
         }
         $r.content = $content
+        if ($parsed.choices[0].finish_reason) { $r.finish = [string]$parsed.choices[0].finish_reason }
     }
     else {
         $r.ok = $false
@@ -266,67 +294,137 @@ function Invoke-ChatCompletion {
     return $r
 }
 
-# ------------------------------------------------------------- image generation
-function Save-RemoteImage {
-    param([string]$RemoteUrl)
-    $name = [Guid]::NewGuid().ToString('N') + '.png'
-    $dest = Join-Path $ImgDir $name
-    try {
-        $wc = New-Object Net.WebClient
-        $wc.Headers.Add('User-Agent', 'HuiZhiAI/1.0')
-        $wc.DownloadFile($RemoteUrl, $dest)
-        return @{ file = $name; url = "/data/images/$name"; local = $true }
-    }
-    catch {
-        Write-Log "IMAGE download failed, falling back to remote url: $($_.Exception.Message)"
-        return @{ file = ''; url = $RemoteUrl; local = $false }
-    }
+# --------------------------------------------------------------- html pipeline
+# The model returns a whole page. Everything below turns that raw text into
+# something safe to drop into a sandboxed <iframe srcdoc="...">.
+
+# Drop ```html fences and any prose the model wrapped around the document.
+function Get-HtmlPayload {
+    param([string]$Text)
+    if ([string]::IsNullOrWhiteSpace($Text)) { return '' }
+    $h = $Text.Trim()
+    $h = [regex]::Replace($h, '(?s)^```[a-zA-Z]*\s*', '')
+    $h = [regex]::Replace($h, '(?s)```\s*$', '')
+    $h = $h.Trim()
+
+    $i = $h.IndexOf('<!doctype', [StringComparison]::OrdinalIgnoreCase)
+    if ($i -lt 0) { $i = $h.IndexOf('<html', [StringComparison]::OrdinalIgnoreCase) }
+    if ($i -gt 0) { $h = $h.Substring($i) }
+
+    $j = $h.LastIndexOf('</html>', [StringComparison]::OrdinalIgnoreCase)
+    if ($j -ge 0) { $h = $h.Substring(0, $j + 7) }
+    return $h.Trim()
 }
 
-function Invoke-ImageGeneration {
-    param([string]$Prompt, [string]$Ratio)
-    $size = $script:RatioSizes[$Ratio]
-    if (-not $size) { $size = '1024x1024' ; $Ratio = '1:1' }
+# Remove anything executable or remote. Hex colours are intentionally kept:
+# they are the design system, not placeholder noise.
+function Remove-UnsafeHtml {
+    param([string]$Html)
+    if ([string]::IsNullOrWhiteSpace($Html)) { return '' }
+    $h = $Html
+    $h = [regex]::Replace($h, '(?is)<script\b[^>]*>.*?</script\s*>', '')
+    $h = [regex]::Replace($h, '(?is)</?script\b[^>]*>', '')
+    # input / button are intentionally NOT stripped: inside the sandbox="" frame
+    # they are inert, and they are the only way a prototype can render a real
+    # text box (with its placeholder) or a real button. Removing them silently
+    # deleted the user-specified placeholder text and button styling.
+    $h = [regex]::Replace($h, '(?is)</?(iframe|frame|frameset|object|embed|applet|base|link|meta|form|audio|video|source|track)\b[^>]*>', '')
+    $h = [regex]::Replace($h, '(?is)\son[a-z]+\s*=\s*"[^"]*"', '')
+    $h = [regex]::Replace($h, "(?is)\son[a-z]+\s*=\s*'[^']*'", '')
+    $h = [regex]::Replace($h, '(?is)\son[a-z]+\s*=\s*[^\s>]+', '')
+    $h = [regex]::Replace($h, '(?i)javascript\s*:', '')
+    $h = [regex]::Replace($h, '(?i)vbscript\s*:', '')
+    $h = [regex]::Replace($h, '(?is)@import[^;]*;', '')
+    $h = [regex]::Replace($h, '(?i)url\(\s*[''"]?\s*https?://[^)]*\)', 'none')
+    return $h
+}
+
+# Only visible text nodes are cleaned. Attribute values (inline styles, class
+# names) are never touched, otherwise `color:#00E5FF` would lose its colour.
+# <style> bodies are stashed first so CSS hex values survive untouched.
+function Clear-PlaceholderText {
+    param([string]$Html)
+    if ([string]::IsNullOrWhiteSpace($Html)) { return '' }
+    $styleBag = New-Object 'System.Collections.Generic.List[string]'
+    $protected = [regex]::Replace($Html, '(?is)<style\b[^>]*>.*?</style\s*>', {
+        param($m)
+        $styleBag.Add($m.Value)
+        return ('@@HZSTYLE' + ($styleBag.Count - 1) + '@@')
+    })
+    $cleaned = [regex]::Replace($protected, '(?s)>([^<]*)<', {
+        param($m)
+        $t = $m.Groups[1].Value
+        # hex test values shown as text, e.g. #1A2B44 / #00C4B4 / #FFF
+        $t = [regex]::Replace($t, '(?<![0-9A-Za-z_])#[0-9A-Fa-f]{3,8}(?![0-9A-Za-z_])', '')
+        # lorem-ipsum filler and generic placeholder words
+        $t = [regex]::Replace($t, '(?i)\b(lorem|ipsum|dolor|consectetur|adipiscing|elit|eiusmod|tempor|incididunt|labore|dolore|magna|aliqua|placeholder|sample)\b', '')
+        $t = [regex]::Replace($t, '[ \t]{2,}', ' ')
+        return ('>' + $t + '<')
+    })
+    for ($i = 0; $i -lt $styleBag.Count; $i++) {
+        $cleaned = $cleaned.Replace('@@HZSTYLE' + $i + '@@', $styleBag[$i])
+    }
+    return $cleaned
+}
+
+# Full pipeline: fence strip -> sanitize -> text clean -> guarantee a document.
+function ConvertTo-SafeHtml {
+    param([string]$Raw)
+    $h = Get-HtmlPayload -Text $Raw
+    if ([string]::IsNullOrWhiteSpace($h)) { return '' }
+    $h = Remove-UnsafeHtml -Html $h
+    $h = Clear-PlaceholderText -Html $h
+
+    # A page that does not declare a viewport-capable reset can end up with
+    # default body margins and scrollbars; inject one before the model's own
+    # styles so the model can still override any of it.
+    $reset = '<style id="hz-reset">html,body{margin:0;padding:0;box-sizing:border-box}' +
+        '*,*::before,*::after{box-sizing:border-box}html,body{width:100%;height:100%;overflow:hidden}</style>'
+    if ([regex]::IsMatch($h, '(?i)<head\b[^>]*>')) {
+        $h = [regex]::Replace($h, '(?i)<head\b([^>]*)>', ('<head$1><meta charset="utf-8">' + $reset))
+    }
+    else {
+        $h = '<!doctype html><html><head><meta charset="utf-8">' + $reset + '</head><body>' + $h + '</body></html>'
+    }
+    return $h
+}
+
+# ------------------------------------------------------------ page generation
+# Stage 2 - the model writes the real HTML page for a stored design brief.
+function Invoke-HtmlGeneration {
+    param([string]$Brief, [string]$Ratio, [hashtable]$Extra)
 
     if ([string]::IsNullOrWhiteSpace($script:ApiKey)) {
         return @{ ok = $false; status = 0; attempts = 0; ms = 0; msg = 'no_api_key' }
     }
 
-    $payload = @{ model = $script:ImageModel; prompt = $Prompt; n = 1; size = $size }
-    $r = Invoke-AgnesPost -Path '/images/generations' -Payload $payload -MaxAttempts 2 -TimeoutSec 75
-    # Fall back to the previous-generation image model once before giving up.
-    if (-not $r.ok -and $script:ImageModelFallback) {
-        Write-Log "IMAGE retry with fallback model=$($script:ImageModelFallback) ratio=$Ratio"
-        $payload.model = $script:ImageModelFallback
-        $r = Invoke-AgnesPost -Path '/images/generations' -Payload $payload -MaxAttempts 1 -TimeoutSec 75
+    $Config = Get-RoleConfig
+    $canvas = Get-Canvas -Ratio $Ratio
+    $prompt = Fill-Template -Template $Config.shared.htmlTemplate -Vars @{
+        roleName    = [string]$Extra.roleName
+        styleGuide  = [string]$Extra.styleGuide
+        requirement = [string]$Extra.requirement
+        designBrief = $Brief
+        ratio       = $Ratio
+        canvasW     = [string]$canvas.w
+        canvasH     = [string]$canvas.h
+        seed        = [string]$Extra.seed
     }
+
+    # A 16 KB page can take ~90s to stream back, so the code stage gets a wider
+    # per-attempt budget and one retry instead of three.
+    $r = Invoke-ChatCompletion -System $Config.shared.systemPrompt -Prompt $prompt `
+        -Temperature 0.7 -MaxTokens $script:HtmlMaxTokens -MaxAttempts 2 -TimeoutSec 150
     if (-not $r.ok) { return $r }
 
-    $parsed = $null
-    try { $parsed = $r.body | ConvertFrom-Json } catch {}
-    $data = $null
-    if ($parsed -and $parsed.data) { $data = $parsed.data[0] }
-    if (-not $data) {
-        $r.ok = $false; $r.status = 502; $r.msg = 'unexpected image response shape'
+    $html = ConvertTo-SafeHtml -Raw $r.content
+    if ([string]::IsNullOrWhiteSpace($html) -or $html.Length -lt 200) {
+        $r.ok = $false; $r.status = 502; $r.msg = 'model returned no usable html'
         return $r
     }
-
-    $saved = @{ file = ''; url = ''; local = $false }
-    if ($data.url) { $saved = Save-RemoteImage -RemoteUrl $data.url }
-    elseif ($data.b64_json) {
-        $name = [Guid]::NewGuid().ToString('N') + '.png'
-        [IO.File]::WriteAllBytes((Join-Path $ImgDir $name), [Convert]::FromBase64String($data.b64_json))
-        $saved = @{ file = $name; url = "/data/images/$name"; local = $true }
-    }
-    else {
-        $r.ok = $false; $r.status = 502; $r.msg = 'image response contains neither url nor b64_json'
-        return $r
-    }
-
-    $r.imageUrl  = $saved.url
-    $r.imageFile = $saved.file
-    $r.size      = $size
-    $r.ratio     = $Ratio
+    $r.html  = $html
+    $r.ratio = $Ratio
+    $r.size  = $canvas.label
     return $r
 }
 
@@ -354,7 +452,7 @@ function Get-RecordById {
     return $null
 }
 
-# public projection: never leak imagePrompt / prompt engineering to the client
+# public projection: never leak designBrief / prompt engineering to the client
 function ConvertTo-PublicRecord {
     param($Record)
     if (-not $Record) { return $null }
@@ -370,8 +468,7 @@ function ConvertTo-PublicRecord {
         visiblePrompt = $Record.visiblePrompt
         agentReply    = $Record.agentReply
         keywords      = $Record.keywords
-        imageUrl      = $Record.imageUrl
-        imageFile     = $Record.imageFile
+        html          = $Record.html
         size          = $Record.size
         createdAt     = $Record.createdAt
         updatedAt     = $Record.updatedAt
@@ -489,31 +586,38 @@ function Invoke-PlanStage {
     }
     # No length cap: the AI requirement box accepts unlimited input by design.
 
-    $ratio = Get-Step $Body 'ratio' $role.defaultRatio
-    if ($script:Ratios -notcontains $ratio) { $ratio = $role.defaultRatio }
-
+    # The canvas is no longer a user choice: the model reads the brief and picks
+    # the ratio itself. It is validated after the plan comes back, so the canvas
+    # is always one of the known sizes.
     $seed = New-VariationSeed
     $prompt = Fill-Template -Template $Config.shared.plannerTemplate -Vars @{
         roleName    = $role.name
         deliverable = $role.deliverable
         styleGuide  = $role.styleGuide
         requirement = $req
-        ratio       = $ratio
         seed        = $seed
         directions  = (Get-RandomDirections -Config $Config -Count 3)
     }
 
     $t0 = Get-Date
-    Write-Log "PLAN start role=$($role.id) ratio=$ratio seed=$seed reqLen=$($req.Length)"
+    Write-Log "PLAN start role=$($role.id) seed=$seed reqLen=$($req.Length)"
     $llm = Invoke-ChatCompletion -Prompt $prompt -Temperature 1.0 -TimeoutSec 60
     if (-not $llm.ok) { Write-UpstreamFail $Ctx $llm 'plan'; return }
 
     $plan = Parse-LlmJson -Text $llm.content
-    if (-not $plan -or -not $plan.imagePrompt) {
+    if (-not $plan -or -not $plan.designBrief) {
         Write-Log "PLAN parse_failed stage=plan ms=$($llm.ms) rawLen=$($llm.content.Length)"
         Write-Fail $Ctx 'plan_parse_failed' 'The model did not return a parsable plan.' 502
         return
     }
+
+    # Auto-fit canvas: unknown or missing values fall back to the role default.
+    $ratio = [string]$plan.ratio
+    if ($script:Ratios -notcontains $ratio) {
+        Write-Log "PLAN ratio_fallback got='$ratio' using=$($role.defaultRatio)"
+        $ratio = $role.defaultRatio
+    }
+    $canvas = Get-Canvas -Ratio $ratio
 
     $Records = Get-Records
     $record = [ordered]@{
@@ -523,16 +627,15 @@ function Invoke-PlanStage {
         roleIndex     = $role.index
         requirement   = $req
         ratio         = $ratio
-        size          = $script:RatioSizes[$ratio]
+        size          = $canvas.label
         seed          = $seed
         title         = [string]$plan.title
         summary       = [string]$plan.summary
         visiblePrompt = [string]$plan.visiblePrompt
-        imagePrompt   = [string]$plan.imagePrompt
+        designBrief   = [string]$plan.designBrief
         agentReply    = [string]$plan.agentReply
         keywords      = @($plan.keywords)
-        imageUrl      = ''
-        imageFile     = ''
+        html          = ''
         createdAt     = (Get-NowIso)
         updatedAt     = (Get-NowIso)
         revisions     = @()
@@ -545,48 +648,56 @@ function Invoke-PlanStage {
     Save-Records -Records $Records
 
     $secs = [Math]::Round(((Get-Date) - $t0).TotalSeconds, 1)
-    Write-Log "PLAN ok id=$($record.id) ms=$($llm.ms) total=${secs}s"
+    Write-Log "PLAN ok id=$($record.id) ratio=$ratio size=$($canvas.label) ms=$($llm.ms) total=${secs}s"
     Write-Json $Ctx @{ ok = $true; record = (ConvertTo-PublicRecord -Record $record) }
 }
 
 # ----------------------------------------------------------------- api: rendering
-# Stage 2 - image model renders the stored prompt at the requested aspect ratio.
+# Stage 2 - the model writes the HTML page for the stored design brief. The
+# canvas was already auto-fitted to the brief during planning, so rendering just
+# reuses the ratio stored on the record.
 function Invoke-RenderStage {
     param($Ctx, $Body)
     $id = Get-Step $Body 'id' ''
     $Records = Get-Records
     $record = Get-RecordById -Records $Records -Id $id
     if (-not $record) { Write-Fail $Ctx 'not_found' "record $id not found" 404; return }
-    if ([string]::IsNullOrWhiteSpace($record.imagePrompt)) {
-        Write-Fail $Ctx 'missing_prompt' 'record has no image prompt'; return
+    if ([string]::IsNullOrWhiteSpace($record.designBrief)) {
+        Write-Fail $Ctx 'missing_brief' 'record has no design brief'; return
     }
 
-    $ratio = Get-Step $Body 'ratio' $record.ratio
-    if ($script:Ratios -notcontains $ratio) { $ratio = $record.ratio }
+    $ratio = [string]$record.ratio
+    if ($script:Ratios -notcontains $ratio) { $ratio = '16:9' }
+
+    $Config = Get-RoleConfig
+    $role = Get-Role -Config $Config -RoleId $record.roleId
 
     $t0 = Get-Date
     Write-Log "RENDER start id=$id ratio=$ratio"
-    $img = Invoke-ImageGeneration -Prompt $record.imagePrompt -Ratio $ratio
-    if (-not $img.ok) { Write-UpstreamFail $Ctx $img 'render'; return }
+    $gen = Invoke-HtmlGeneration -Brief $record.designBrief -Ratio $ratio -Extra @{
+        roleName    = $role.name
+        styleGuide  = $role.styleGuide
+        requirement = $record.requirement
+        seed        = $record.seed
+    }
+    if (-not $gen.ok) { Write-UpstreamFail $Ctx $gen 'render'; return }
 
     $rev = [pscustomobject]@{
-        at        = (Get-NowIso)
-        ratio     = $img.ratio
-        size      = $img.size
-        imageUrl  = $img.imageUrl
-        imageFile = $img.imageFile
-        note      = 'initial'
+        at    = (Get-NowIso)
+        ratio = $gen.ratio
+        size  = $gen.size
+        html  = $gen.html
+        note  = 'initial'
     }
-    $record.imageUrl  = $img.imageUrl
-    $record.imageFile = $img.imageFile
-    $record.ratio     = $img.ratio
-    $record.size      = $img.size
+    $record.html      = $gen.html
+    $record.ratio     = $gen.ratio
+    $record.size      = $gen.size
     $record.revisions = @($record.revisions) + @($rev)
     $record.updatedAt = (Get-NowIso)
     Save-Records -Records $Records
 
     $secs = [Math]::Round(((Get-Date) - $t0).TotalSeconds, 1)
-    Write-Log "RENDER ok id=$id ms=$($img.ms) total=${secs}s local=$($img.imageFile -ne '')"
+    Write-Log "RENDER ok id=$id ms=$($gen.ms) total=${secs}s htmlLen=$($gen.html.Length) finish=$($gen.finish)"
     Write-Json $Ctx @{ ok = $true; record = (ConvertTo-PublicRecord -Record $record) }
 }
 
@@ -615,11 +726,14 @@ function Invoke-RefineStage {
     }
     $session = ($sessionLines -join "`n")
 
+    $canvas = Get-Canvas -Ratio $record.ratio
     $prompt = Fill-Template -Template $Config.shared.refineTemplate -Vars @{
         roleName       = $role.name
         styleGuide     = $role.styleGuide
         ratio          = $record.ratio
-        currentPrompt  = $record.imagePrompt
+        canvasW        = [string]$canvas.w
+        canvasH        = [string]$canvas.h
+        currentBrief   = $record.designBrief
         currentVisible = $record.visiblePrompt
         session        = $session
         instruction    = $instruction
@@ -631,13 +745,13 @@ function Invoke-RefineStage {
     if (-not $llm.ok) { Write-UpstreamFail $Ctx $llm 'refine'; return }
 
     $upd = Parse-LlmJson -Text $llm.content
-    if (-not $upd -or -not $upd.imagePrompt) {
+    if (-not $upd -or -not $upd.designBrief) {
         Write-Log "REFINE parse_failed ms=$($llm.ms) rawLen=$($llm.content.Length)"
         Write-Fail $Ctx 'refine_parse_failed' 'The model did not return a parsable refinement.' 502
         return
     }
 
-    $record.imagePrompt   = [string]$upd.imagePrompt
+    $record.designBrief  = [string]$upd.designBrief
     if ($upd.visiblePrompt) { $record.visiblePrompt = [string]$upd.visiblePrompt }
     $reply = [string]$upd.agentReply
     if (-not $reply) { $reply = [string]$upd.changed }
@@ -654,44 +768,6 @@ function Invoke-RefineStage {
     Write-Json $Ctx @{ ok = $true; record = (ConvertTo-PublicRecord -Record $record); changed = [string]$upd.changed }
 }
 
-# --------------------------------------------------------- api: rerender / redo
-# Ratio switch: same prompt, new canvas size -> keeps content consistent.
-function Invoke-RerenderStage {
-    param($Ctx, $Body)
-    $id = Get-Step $Body 'id' ''
-    $ratio = Get-Step $Body 'ratio' ''
-    if ($script:Ratios -notcontains $ratio) { Write-Fail $Ctx 'bad_ratio' 'unsupported ratio'; return }
-
-    $Records = Get-Records
-    $record = Get-RecordById -Records $Records -Id $id
-    if (-not $record) { Write-Fail $Ctx 'not_found' "record $id not found" 404; return }
-
-    $t0 = Get-Date
-    Write-Log "RERENDER start id=$id ratio=$ratio"
-    $img = Invoke-ImageGeneration -Prompt $record.imagePrompt -Ratio $ratio
-    if (-not $img.ok) { Write-UpstreamFail $Ctx $img 'rerender'; return }
-
-    $rev = [pscustomobject]@{
-        at        = (Get-NowIso)
-        ratio     = $img.ratio
-        size      = $img.size
-        imageUrl  = $img.imageUrl
-        imageFile = $img.imageFile
-        note      = ("ratio " + $ratio)
-    }
-    $record.imageUrl  = $img.imageUrl
-    $record.imageFile = $img.imageFile
-    $record.ratio     = $img.ratio
-    $record.size      = $img.size
-    $record.revisions = @($record.revisions) + @($rev)
-    $record.updatedAt = (Get-NowIso)
-    Save-Records -Records $Records
-
-    $secs = [Math]::Round(((Get-Date) - $t0).TotalSeconds, 1)
-    Write-Log "RERENDER ok id=$id ms=$($img.ms) total=${secs}s"
-    Write-Json $Ctx @{ ok = $true; record = (ConvertTo-PublicRecord -Record $record) }
-}
-
 # Re-roll: brand new creative direction + seed, same brief. Guarantees that the
 # same input never yields the same visual twice.
 function Invoke-RegenerateStage {
@@ -704,13 +780,11 @@ function Invoke-RegenerateStage {
     $Config = Get-RoleConfig
     $role = Get-Role -Config $Config -RoleId $record.roleId
     $seed = New-VariationSeed
-
     $prompt = Fill-Template -Template $Config.shared.plannerTemplate -Vars @{
         roleName    = $role.name
         deliverable = $role.deliverable
         styleGuide  = $role.styleGuide
         requirement = $record.requirement
-        ratio       = $record.ratio
         seed        = $seed
         directions  = (Get-RandomDirections -Config $Config -Count 3)
     }
@@ -721,32 +795,40 @@ function Invoke-RegenerateStage {
     if (-not $llm.ok) { Write-UpstreamFail $Ctx $llm 'regenerate'; return }
 
     $plan = Parse-LlmJson -Text $llm.content
-    if (-not $plan -or -not $plan.imagePrompt) {
+    if (-not $plan -or -not $plan.designBrief) {
         Write-Fail $Ctx 'plan_parse_failed' 'The model did not return a parsable plan.' 502; return
     }
 
-    $img = Invoke-ImageGeneration -Prompt ([string]$plan.imagePrompt) -Ratio $record.ratio
-    if (-not $img.ok) { Write-UpstreamFail $Ctx $img 'regenerate-render'; return }
+    # A new creative direction may also deserve a different canvas; keep the
+    # current one when the model does not return a usable ratio.
+    $ratio = [string]$plan.ratio
+    if ($script:Ratios -notcontains $ratio) { $ratio = $record.ratio }
+
+    $gen = Invoke-HtmlGeneration -Brief ([string]$plan.designBrief) -Ratio $ratio -Extra @{
+        roleName    = $role.name
+        styleGuide  = $role.styleGuide
+        requirement = $record.requirement
+        seed        = $seed
+    }
+    if (-not $gen.ok) { Write-UpstreamFail $Ctx $gen 'regenerate-render'; return }
 
     $rev = [pscustomobject]@{
-        at        = (Get-NowIso)
-        ratio     = $img.ratio
-        size      = $img.size
-        imageUrl  = $img.imageUrl
-        imageFile = $img.imageFile
-        note      = 'regenerate'
+        at    = (Get-NowIso)
+        ratio = $gen.ratio
+        size  = $gen.size
+        html  = $gen.html
+        note  = 'regenerate'
     }
     $record.title = [string]$plan.title
     $record.summary = [string]$plan.summary
     $record.visiblePrompt = [string]$plan.visiblePrompt
-    $record.imagePrompt = [string]$plan.imagePrompt
+    $record.designBrief = [string]$plan.designBrief
     $record.agentReply = [string]$plan.agentReply
     $record.keywords = @($plan.keywords)
     $record.seed = [string]$seed
-    $record.imageUrl  = $img.imageUrl
-    $record.imageFile = $img.imageFile
-    $record.ratio     = $img.ratio
-    $record.size      = $img.size
+    $record.html      = $gen.html
+    $record.ratio     = $gen.ratio
+    $record.size      = $gen.size
     $record.revisions = @($record.revisions) + @($rev)
     $record.messages  = @($record.messages) + @(
         [pscustomobject]@{ role = 'agent'; text = [string]$plan.agentReply; at = (Get-NowIso) }
@@ -755,7 +837,7 @@ function Invoke-RegenerateStage {
     Save-Records -Records $Records
 
     $secs = [Math]::Round(((Get-Date) - $t0).TotalSeconds, 1)
-    Write-Log "REGENERATE ok id=$id ms=$($llm.ms)+$($img.ms) total=${secs}s"
+    Write-Log "REGENERATE ok id=$id ms=$($llm.ms)+$($gen.ms) total=${secs}s"
     Write-Json $Ctx @{ ok = $true; record = (ConvertTo-PublicRecord -Record $record) }
 }
 
@@ -772,17 +854,17 @@ function Handle-Api {
 
     if ($Path -eq '/api/health') {
         $keyOk = -not [string]::IsNullOrWhiteSpace($script:ApiKey)
-        $chatPub = @{ configured = $keyOk; name = 'Agnes AI'; model = $script:TextModel;  baseUrl = $script:BaseUrl }
-        $imgPub  = @{ configured = $keyOk; name = 'Agnes AI'; model = $script:ImageModel; baseUrl = $script:BaseUrl }
+        $chatPub = @{ configured = $keyOk; name = 'Agnes AI'; model = $script:TextModel; baseUrl = $script:BaseUrl }
+        $codePub = @{ configured = $keyOk; name = 'Agnes AI'; model = $script:TextModel; baseUrl = $script:BaseUrl }
         Write-Json $Ctx @{
             ok         = $true
             service    = 'huizhi-ai'
-            version    = '3.0.0'
+            version    = '4.0.0'
             provider   = 'Agnes AI'
             baseUrl    = $script:BaseUrl
             ratios     = $script:Ratios
             chat       = $chatPub
-            image      = $imgPub
+            codegen    = $codePub
             configured = $keyOk
             time       = (Get-NowIso)
         }
@@ -835,7 +917,7 @@ function Handle-Api {
 
     # Resolve the path first so an unknown endpoint returns a proper 404,
     # leaving 405 to mean "right endpoint, wrong method".
-    $postOnly = @('/api/plan', '/api/render', '/api/refine', '/api/rerender', '/api/regenerate')
+    $postOnly = @('/api/plan', '/api/render', '/api/refine', '/api/regenerate')
     if ($postOnly -notcontains $Path) {
         Write-Fail $Ctx 'unknown_endpoint' ("unknown endpoint " + $Path) 404
         return
@@ -850,7 +932,6 @@ function Handle-Api {
         '/api/plan'       { Invoke-PlanStage       -Ctx $Ctx -Body $Body }
         '/api/render'     { Invoke-RenderStage     -Ctx $Ctx -Body $Body }
         '/api/refine'     { Invoke-RefineStage     -Ctx $Ctx -Body $Body }
-        '/api/rerender'   { Invoke-RerenderStage   -Ctx $Ctx -Body $Body }
         '/api/regenerate' { Invoke-RegenerateStage -Ctx $Ctx -Body $Body }
     }
 }
@@ -989,13 +1070,13 @@ $keyOk2 = -not [string]::IsNullOrWhiteSpace($script:ApiKey)
 Write-Host "   Provider : Agnes AI"
 Write-Host "   BaseUrl  : $($script:BaseUrl)"
 Write-Host "   Text     : $($script:TextModel)"
-Write-Host "   Image    : $($script:ImageModel)"
+Write-Host "   Codegen  : $($script:TextModel)  (self-contained HTML pages)"
 Write-Host "   KEY      : $(if ($keyOk2) { 'configured (from .env)' } else { 'MISSING -> set AGNES_API_KEY in .env' })" -ForegroundColor $(if ($keyOk2) { 'Gray' } else { 'Yellow' })
 Write-Host "   Bind     : $($script:ActivePrefix)"
 Write-Host "   Stop     : Ctrl + C"
 Write-Host ""
 
-Write-Log "SERVER start prefix=$($script:ActivePrefix) provider=AgnesAI text=$($script:TextModel) image=$($script:ImageModel) key=$($keyOk2)"
+Write-Log "SERVER start prefix=$($script:ActivePrefix) provider=AgnesAI text=$($script:TextModel) key=$($keyOk2)"
 
 while ($listener.IsListening) {
     $ctx = $null

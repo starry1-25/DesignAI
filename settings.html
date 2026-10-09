@@ -50,23 +50,23 @@
         <div class="setting-row"><span class="label">服务版本</span><span class="value" id="svcVersion">—</span></div>
         <div class="setting-row"><span class="label">AI 服务</span><span class="value" id="svcProvider">—</span></div>
         <div class="setting-row"><span class="label">文本模型</span><span class="value" id="svcChat">—</span></div>
-        <div class="setting-row"><span class="label">图像模型</span><span class="value" id="svcImage">—</span></div>
+        <div class="setting-row"><span class="label">页面生成模型</span><span class="value" id="svcCodegen">—</span></div>
         <div class="setting-row"><span class="label">可用状态</span><span class="value" id="svcReady">—</span></div>
       </div>
 
       <!-- ============================================ 默认生成偏好 -->
       <div class="card">
         <h3>默认生成偏好</h3>
-        <p>仅保存在本机浏览器，用于首页的初始岗位与画幅。</p>
+        <p>仅保存在本机浏览器，用于首页的初始岗位。画幅由 AI 根据你的需求描述自动适配。</p>
 
         <div class="setting-row" style="flex-direction:column;align-items:flex-start;gap:9px">
           <span class="label">默认岗位</span>
           <div class="chips" id="prefRoles" style="flex-wrap:wrap"></div>
         </div>
 
-        <div class="setting-row" style="flex-direction:column;align-items:flex-start;gap:9px">
-          <span class="label">默认比例</span>
-          <div class="chips" id="prefRatios" style="flex-wrap:wrap"></div>
+        <div class="setting-row">
+          <span class="label">画幅</span>
+          <span class="value">AI 按需求自动适配（无需选择）</span>
         </div>
 
         <div class="setting-row">
@@ -78,10 +78,10 @@
       <!-- ============================================ 数据管理 -->
       <div class="card">
         <h3>数据管理</h3>
-        <p>历史记录与生成的图片都保存在本地 <code>data/</code> 目录。</p>
+        <p>历史记录与生成的页面代码都保存在本地 <code>data/</code> 目录。</p>
         <div class="setting-row"><span class="label">历史记录数量</span><span class="value" id="dataCount">—</span></div>
         <div class="setting-row"><span class="label">记录存储位置</span><span class="value">data/records.json</span></div>
-        <div class="setting-row"><span class="label">图片存储位置</span><span class="value">data/images/</span></div>
+        <div class="setting-row"><span class="label">页面存储位置</span><span class="value">内嵌于 data/records.json</span></div>
         <div class="setting-row" style="gap:8px">
           <span class="label">管理历史</span>
           <a class="btn" href="history.html"><span data-icon="history"></span><span>前往历史记录</span></a>
@@ -111,7 +111,7 @@
           <span class="label">岗位覆盖</span>
           <span class="value">产品经理 · 交互设计 · UI 设计 · 运营设计 · 前端开发</span>
         </div>
-        <div class="setting-row"><span class="label">生成画幅</span><span class="value">1:1 · 16:9 · 9:16 · 4:3</span></div>
+        <div class="setting-row"><span class="label">生成画幅</span><span class="value">AI 按需求描述自动适配</span></div>
         <div class="setting-row">
           <span class="label">AI 服务</span>
           <span class="value">由服务端统一调用 Agnes AI，客户端无需配置</span>

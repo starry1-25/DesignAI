@@ -16,7 +16,6 @@
   ];
 
   let roles = FALLBACK_ROLES.slice();
-  let ratios = ['1:1', '16:9', '9:16', '4:3'];
   let prefs = {};
 
   /* ------------------------------------------------------------------ 偏好 */
@@ -36,17 +35,12 @@
 
   function renderPrefs() {
     if (!prefs.roleId) prefs.roleId = (roles[0] || FALLBACK_ROLES[0]).id;
-    if (!prefs.ratio) prefs.ratio = '16:9';
 
     $('#prefRoles').innerHTML = roles.map((r) =>
       '<button class="chip chip-text' + (r.id === prefs.roleId ? ' is-on' : '') + '" type="button" ' +
       'data-role="' + ui.esc(r.id) + '">' + ui.esc(r.name) + '</button>').join('');
 
-    $('#prefRatios').innerHTML = ratios.map((r) =>
-      '<button class="chip' + (r === prefs.ratio ? ' is-on' : '') + '" type="button" ' +
-      'data-ratio="' + ui.esc(r) + '">' + ui.esc(r) + '</button>').join('');
-
-    $('#prefSummary').textContent = roleName(prefs.roleId) + ' · ' + prefs.ratio;
+    $('#prefSummary').textContent = roleName(prefs.roleId) + ' · 画幅由 AI 按需求自动适配';
   }
 
   function bindPrefs() {
@@ -56,14 +50,6 @@
       prefs.roleId = b.dataset.role;
       savePrefs(); renderPrefs();
       ui.toast('默认岗位已设为「' + roleName(prefs.roleId) + '」', 'ok');
-    });
-
-    $('#prefRatios').addEventListener('click', (e) => {
-      const b = e.target.closest('[data-ratio]');
-      if (!b) return;
-      prefs.ratio = b.dataset.ratio;
-      savePrefs(); renderPrefs();
-      ui.toast('默认比例已设为 ' + prefs.ratio, 'ok');
     });
   }
 
@@ -85,30 +71,39 @@
       $('#svcVersion').textContent = '静态部署';
       $('#svcProvider').textContent = 'Agnes AI';
       $('#svcChat').textContent = '需在本机运行后端';
-      $('#svcImage').textContent = '需在本机运行后端';
+      $('#svcCodegen').textContent = '需在本机运行后端';
       $('#svcReady').textContent = '静态部署不可用';
       ui.offlineBar(ui.STATIC_NOTICE);
       return;
     }
 
-    try {
-      const h = await api.health();
-      live.classList.remove('is-off');
-      live.innerHTML = '<i aria-hidden="true"></i> 正常';
-      $('#svcVersion').textContent = 'v' + (h.version || '—');
-      $('#svcProvider').textContent = h.provider || 'Agnes AI';
-      $('#svcChat').textContent = describe(h.chat);
-      $('#svcImage').textContent = describe(h.image);
-      $('#svcReady').textContent = h.configured ? '就绪，可以生成视觉稿' : '服务端未配置 API 密钥';
-    } catch (_) {
+    // 一次探测失败不等于服务挂了：后端跑长任务时会被短暂占满，重试几次再下结论
+    let h = null;
+    for (let i = 0; i < 3 && !h; i++) {
+      try { h = await api.health(4000); }
+      catch (_) { if (i < 2) await new Promise((r) => setTimeout(r, 1200)); }
+    }
+
+    if (!h) {
+      live.classList.remove('is-on');
       live.classList.add('is-off');
       live.innerHTML = '<i aria-hidden="true"></i> 未连接';
-      ['#svcVersion', '#svcProvider', '#svcChat', '#svcImage', '#svcReady'].forEach((s) => {
+      ['#svcVersion', '#svcProvider', '#svcChat', '#svcCodegen', '#svcReady'].forEach((s) => {
         const el = $(s);
         if (el) el.textContent = '—';
       });
-      ui.offlineBar('本地服务未响应，请先运行 <strong>start.ps1</strong> 后再刷新页面。');
+      ui.offlineBar('本地服务未响应，正在自动重试…（若长时间未恢复，请在本机运行 <strong>start.ps1</strong>）');
+      ui.watchBackend();
+      return;
     }
+
+    live.classList.remove('is-off');
+    live.innerHTML = '<i aria-hidden="true"></i> 正常';
+    $('#svcVersion').textContent = 'v' + (h.version || '—');
+    $('#svcProvider').textContent = h.provider || 'Agnes AI';
+    $('#svcChat').textContent = describe(h.chat);
+    $('#svcCodegen').textContent = describe(h.codegen);
+    $('#svcReady').textContent = h.configured ? '就绪，可以生成视觉稿' : '服务端未配置 API 密钥';
   }
 
   /* -------------------------------------------------------------- 数据统计 */
@@ -134,10 +129,7 @@
     // 岗位列表优先取服务端（静态托管下没有后端，直接用内置列表）
     if (ui.hasLocalBackend()) {
       api.roles().then((d) => {
-        if (d && d.roles && d.roles.length) {
-          roles = d.roles;
-          if (d.ratios && d.ratios.length) ratios = d.ratios;
-        }
+        if (d && d.roles && d.roles.length) roles = d.roles;
         renderPrefs();
       }).catch(() => { renderPrefs(); });
     }
@@ -154,6 +146,8 @@
 
     loadHealth();
     loadData();
+    // 服务恢复后自动把状态刷回正常，无需用户手动刷新
+    ui.onBackendUp(() => { loadHealth(); loadData(); });
   }
 
   if (document.readyState === 'loading') {

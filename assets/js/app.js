@@ -53,9 +53,8 @@
 
   const state = {
     roles: FALLBACK_ROLES.slice(),
-    ratios: ['1:1', '16:9', '9:16', '4:3'],
     roleId: 'pm',
-    ratio: '16:9',
+    ratio: '16:9',          // 仅用于尚未出图时的示例占位画框
     record: null,
     revIndex: -1,
     zoom: 0,
@@ -130,20 +129,16 @@
   }
 
   /* ----------------------------------------------------------------- 工具栏 */
-  /* 控件可用性由数据决定：
-     hasImage  —— 当前是否有可展示/可下载的图（决定比例切换与下载）
+  /* 画幅不再由用户选择：模型会按需求描述自动适配，工具栏只保留对结果的操作。
+     控件可用性由数据决定：
+     hasPage   —— 当前是否有可展示/可下载的页面（决定下载）
      hasPrompt —— 是否已有解析结果（决定复制 Prompt 与重新生成）
      避免出现「看起来能点、点了没反应」的死控件 */
   function toolbarHTML(opt) {
     const o = opt || {};
-    const ratio = o.ratio || state.ratio;
     const busy = !!o.busy;
-    const canImg = !busy && !!o.hasImage;
+    const canPage = !busy && !!o.hasPage;
     const canPrompt = !busy && !!o.hasPrompt;
-
-    const chips = state.ratios.map((r) =>
-      '<button class="chip' + (r === ratio ? ' is-on' : '') + '" type="button" data-ratio="' + r + '"' +
-      (busy ? ' disabled' : '') + ' aria-pressed="' + (r === ratio) + '">' + r + '</button>').join('');
 
     return '<div class="toolbar">' +
       '<div class="tool-group">' +
@@ -152,15 +147,13 @@
         '<button class="ico-btn" type="button" data-act="redo" title="下一步" aria-label="下一步"' +
           (o.canRedo && !busy ? '' : ' disabled') + ' data-icon="redo"></button>' +
       '</div>' +
-      '<div class="tool-sep" aria-hidden="true"></div>' +
-      '<div class="chips" role="group" aria-label="图片比例">' + chips + '</div>' +
       '<div class="tool-right">' +
         '<button class="btn" type="button" data-act="copy"' + (canPrompt ? '' : ' disabled') +
           ' title="复制本次的业务 Prompt"><span data-icon="copy"></span><span class="btn-label">复制 Prompt</span></button>' +
         '<button class="btn" type="button" data-act="regen"' + (canPrompt ? '' : ' disabled') +
           ' title="换一个全新的创意方向"><span data-icon="refresh"></span><span class="btn-label">重新生成</span></button>' +
-        '<button class="btn is-primary" type="button" data-act="download"' + (canImg ? '' : ' disabled') +
-          ' title="下载当前视觉稿"><span data-icon="download"></span><span class="btn-label">下载</span></button>' +
+        '<button class="btn is-primary" type="button" data-act="download"' + (canPage ? '' : ' disabled') +
+          ' title="下载当前页面（HTML 源文件）"><span data-icon="download"></span><span class="btn-label">下载</span></button>' +
       '</div>' +
     '</div>';
   }
@@ -195,12 +188,42 @@
     }).join('');
   }
 
-  function canvasHTML(src, ratio, meta) {
-    const inner = src
-      ? '<img class="canvas-img" src="' + ui.esc(src) + '" alt="AI 生成的视觉稿" referrerpolicy="no-referrer">'
+  /* 画幅比例 → 宽高比数值，供 iframe 容器计算像素尺寸 */
+  function ratioToAR(ratio) {
+    const p = String(ratio || '16:9').split(':');
+    const a = parseFloat(p[0]) || 16;
+    const b = parseFloat(p[1]) || 9;
+    return a / b;
+  }
+
+  /* 画布像素尺寸（如 1400x1050）。生成页是按这个尺寸写死版式的，
+     所以 iframe 必须用同样的像素渲染，再整体缩放去适应容器。 */
+  function parseCanvasSize(size) {
+    const m = /^(\d+)\s*[x×]\s*(\d+)$/i.exec(String(size || '').trim());
+    if (!m) return null;
+    const w = parseInt(m[1], 10);
+    const h = parseInt(m[2], 10);
+    return (w > 0 && h > 0) ? { w: w, h: h } : null;
+  }
+
+  /* 生成结果用原生 DOM 渲染：把模型产出的整页 HTML 直接放进沙箱 iframe。
+     DOM 渲染天然是矢量级的，任意缩放与投屏都保持清晰，不需要先转位图。
+     sandbox 留空表示禁止脚本执行，生成页只作为静态视图呈现。 */
+  function canvasHTML(html, ratio, meta, size) {
+    const ar = ratioToAR(ratio);
+    const dim = parseCanvasSize(size) || { w: 0, h: 0 };
+
+    const inner = html
+      ? '<div class="frame-shell" id="frameShell" data-ar="' + ar + '"' +
+          ' data-cw="' + dim.w + '" data-ch="' + dim.h + '">' +
+          '<div class="frame-fit" id="frameFit">' +
+            '<iframe class="canvas-frame" title="AI 生成的高保真界面" sandbox="" ' +
+              'srcdoc="' + ui.esc(html) + '"></iframe>' +
+          '</div>' +
+        '</div>'
       : $('#tpl-mock').innerHTML;
 
-    const note = src
+    const note = html
       ? ''
       : '<div class="placeholder-note"><span class="meta-pill">示例预览 · 生成后替换</span></div>';
 
@@ -211,6 +234,8 @@
         '<div class="canvas-viewport" id="viewport">' + inner + '</div>' +
         '<div class="canvas-meta">' + (meta || '') + '</div>' +
         '<div class="canvas-zoom">' +
+          (html ? '<button class="meta-pill" type="button" data-act="fullscreen" ' +
+            'title="全屏展示，适合会议投屏">全屏展示</button>' : '') +
           '<button class="meta-pill" type="button" data-act="zoom" title="点击切换缩放">' + zoomLabel + '</button>' +
         '</div>' +
       '</div>' +
@@ -220,7 +245,7 @@
   /* --------------------------------------------------------------- 各视图 */
   function renderEmpty() {
     els.result.innerHTML =
-      toolbarHTML({ ratio: state.ratio }) +
+      toolbarHTML({}) +
       canvasHTML('', state.ratio, '') +
       chatHTML({ disabled: true });
     ui.mountIcons(els.result);
@@ -228,21 +253,21 @@
   }
 
   function renderLoading(step, title) {
-    const steps = ['解析业务需求', '生成视觉稿'];
+    const steps = ['解析业务需求', '生成界面代码'];
     const stepsHTML = steps.map((s, i) => {
       const cls = i < step ? 'is-done' : (i === step ? 'is-active' : '');
       return '<div class="loading-step ' + cls + '"><span class="bulb"></span>' + s + '</div>';
     }).join('');
 
     els.result.innerHTML =
-      toolbarHTML({ busy: true, ratio: state.ratio }) +
+      toolbarHTML({ busy: true }) +
       '<div class="canvas"><div class="canvas-stage"><div class="loading">' +
         '<div class="loading-orb"><span></span><span></span><span></span><b>' +
           (step === 0 ? '01' : '02') + '</b></div>' +
         '<h3>' + ui.esc(title || steps[step] || '处理中') + '</h3>' +
         '<div class="loading-steps">' + stepsHTML + '</div>' +
         '<p style="font-size:12px;color:var(--text-4);max-width:320px">' +
-          '视觉稿生成通常需要 20–60 秒，请保持页面打开，不要刷新。</p>' +
+          '高保真界面生成通常需要 20–60 秒，请保持页面打开，不要刷新。</p>' +
       '</div></div></div>' +
       chatHTML({ disabled: true });
     ui.mountIcons(els.result);
@@ -257,7 +282,7 @@
       ? '<button class="btn is-primary" type="button" data-act="recheck">' +
           '<span data-icon="refresh"></span><span>重新检测</span></button>'
       : '<button class="btn is-primary" type="button" data-act="retry">' +
-          '<span data-icon="refresh"></span><span>' + (canRetryRender ? '只重新出图' : '重试一次') + '</span></button>' +
+          '<span data-icon="refresh"></span><span>' + (canRetryRender ? '只重新生成页面' : '重试一次') + '</span></button>' +
         '<button class="btn" type="button" data-act="regen">' +
           '<span data-icon="bolt"></span><span>换个方向重生成</span></button>';
 
@@ -267,15 +292,14 @@
           '<li><span class="need-ico ok" data-icon="check"></span>' +
             '<span><b>现在就能用</b>：岗位选择、填入示例、浏览示例预览、历史记录</span></li>' +
           '<li><span class="need-ico todo" data-icon="plug"></span>' +
-            '<span><b>需求解析、多轮微调与视觉稿生成</b> —— 服务端配置好 Agnes AI 密钥后会自动恢复</span></li>' +
+            '<span><b>需求解析、多轮微调与高保真界面生成</b> —— 服务端配置好 Agnes AI 密钥后会自动恢复</span></li>' +
         '</ul>'
       : '';
 
     els.result.innerHTML =
       toolbarHTML({
-        ratio: state.ratio,
         hasPrompt: !!(state.record && state.record.visiblePrompt),
-        hasImage: false
+        hasPage: false
       }) +
       '<div class="canvas"><div class="canvas-stage"><div class="empty">' +
         '<div class="empty-ico" data-icon="' + (isSetup ? 'plug' : 'alert') + '"></div>' +
@@ -293,7 +317,7 @@
   /* 静态托管（无后端）时点击生成给出的说明面板：说清"能做什么 / 要怎么做" */
   function renderStaticPanel() {
     els.result.innerHTML =
-      toolbarHTML({ ratio: state.ratio }) +
+      toolbarHTML({}) +
       '<div class="canvas"><div class="canvas-stage"><div class="empty">' +
         '<div class="empty-ico" data-icon="monitor"></div>' +
         '<h3>静态预览部署 · 无法生成视觉稿</h3>' +
@@ -319,26 +343,25 @@
     const idx = state.revIndex >= 0 && state.revIndex < revs.length ? state.revIndex : revs.length - 1;
     state.revIndex = idx;
     const rev = revs[idx] || null;
-    const src = rev ? rev.imageUrl : '';
+    const html = rev ? rev.html : '';
     const ratio = rev ? rev.ratio : rec.ratio;
     const size = rev ? rev.size : rec.size;
 
     const meta = '<span class="meta-pill">' + ui.esc(rec.roleName) + '</span>' +
+      '<span class="meta-pill">AI 自动画幅</span>' +
       (size ? '<span class="meta-pill">' + ui.esc(size) + '</span>' : '') +
-      '<span class="meta-pill">' + ui.esc(ratio) + '</span>' +
       (revs.length > 1 ? '<span class="meta-pill">第 ' + (idx + 1) + ' / ' + revs.length + ' 版</span>' : '');
 
     const tags = (rec.keywords || []).map((k) => '<span class="tag">' + ui.esc(k) + '</span>').join('');
 
     els.result.innerHTML =
       toolbarHTML({
-        ratio: ratio,
         canUndo: idx > 0,
         canRedo: idx < revs.length - 1,
-        hasImage: revs.length > 0,
+        hasPage: !!html,
         hasPrompt: !!rec.visiblePrompt
       }) +
-      canvasHTML(src, ratio, meta) +
+      canvasHTML(html, ratio, meta, size) +
       '<div class="result-brief">' +
         '<h4>' + ui.esc(rec.title || '未命名视觉稿') + '</h4>' +
         '<div class="tags">' + tags + '</div>' +
@@ -353,7 +376,7 @@
       chatHTML({ log: bubblesHTML(rec.messages) });
 
     ui.mountIcons(els.result);
-    applyZoom();
+    layoutFrame();
     bindResult();
     scrollChatToEnd();
   }
@@ -368,23 +391,69 @@
     if (log) log.scrollTop = log.scrollHeight;
   }
 
-  /* ------------------------------------------------------------------ 缩放 */
-  function applyZoom() {
-    const img = $('.canvas-img', els.result);
-    if (!img) return;
-    if (state.zoom === 0) {
-      img.style.cssText = 'width:auto;max-width:100%;max-height:560px;height:auto';
+  /* -------------------------------------------------------- 画幅布局与全屏 */
+  /* 生成页是按画布像素（例如 1400×1050）写死版式的。若把 iframe 直接按容器
+     宽度渲染，页面里那些固定像素的栏宽就会溢出并被 overflow:hidden 裁掉，
+     右侧整栏会凭空消失。正确做法：iframe 严格按画布像素渲染，再用
+     transform: scale() 等比缩放去适应容器 —— 与设计稿预览（Figma）一致，
+     任何容器尺寸下都完整可见，且文字仍是矢量级清晰。 */
+  function layoutFrame() {
+    const shell = $('#frameShell', els.result);
+    const fit = $('#frameFit', els.result);
+    if (!shell || !fit) return;
+    const frame = $('.canvas-frame', els.result);
+
+    const ar = parseFloat(shell.dataset.ar) || 16 / 9;
+    const cw = parseFloat(shell.dataset.cw) || 0;
+    const ch = parseFloat(shell.dataset.ch) || 0;
+    const fs = document.fullscreenElement === shell;
+
+    let availW, availH;
+    if (fs) {
+      availW = window.innerWidth;
+      availH = window.innerHeight;
     } else {
-      img.style.cssText = 'width:' + state.zoom + '%;max-width:none;max-height:none;height:auto';
+      const vp = $('#viewport', els.result);
+      if (!vp) return;
+      availW = vp.clientWidth;
+      availH = vp.clientHeight;
     }
+    if (!availW || !availH) return;
+
+    /* 没有画布像素（示例占位、历史旧数据）：保持容器自适应 */
+    if (!cw || !ch) {
+      const w = (state.zoom === 0 || fs) ? Math.min(availW, availH * ar) : availW * state.zoom / 100;
+      fit.style.width = Math.round(w) + 'px';
+      fit.style.height = Math.round(w / ar) + 'px';
+      if (frame) frame.style.transform = '';
+      return;
+    }
+
+    const fitScale = Math.min(availW / cw, availH / ch);   // 完整装下整页
+    const k = (state.zoom === 0 || fs) ? fitScale : fitScale * state.zoom / 100;
+
+    fit.style.width = Math.round(cw * k) + 'px';
+    fit.style.height = Math.round(ch * k) + 'px';
+    if (frame) {
+      frame.style.width = cw + 'px';
+      frame.style.height = ch + 'px';
+      frame.style.transformOrigin = '0 0';
+      frame.style.transform = 'scale(' + k + ')';
+    }
+  }
+
+  /* 全屏展示：投屏时让页面撑满屏幕，矢量渲染保证文字锐利 */
+  function toggleFullscreen() {
+    const shell = $('#frameShell', els.result);
+    if (!shell) { ui.toast('暂无可展示的页面', 'err'); return; }
+    if (document.fullscreenElement) { document.exitFullscreen(); return; }
+    if (!shell.requestFullscreen) { ui.toast('当前浏览器不支持全屏展示', 'err'); return; }
+    shell.requestFullscreen().catch(() => ui.toast('全屏展示被浏览器拒绝', 'err'));
   }
 
   /* ------------------------------------------------------------- 结果交互 */
   function bindResult() {
     const root = els.result;
-
-    root.querySelectorAll('.chip[data-ratio]').forEach((b) =>
-      b.addEventListener('click', () => switchRatio(b.dataset.ratio)));
 
     root.querySelectorAll('[data-act]').forEach((b) =>
       b.addEventListener('click', () => {
@@ -397,6 +466,7 @@
         if (act === 'retry')  return retryLast();
         if (act === 'recheck') return recheck();
         if (act === 'zoom')   return cycleZoom();
+        if (act === 'fullscreen') return toggleFullscreen();
         if (act === 'toggle-prompt') return togglePrompt(b);
       }));
 
@@ -440,7 +510,7 @@
     state.zoom = ZOOMS[(i + 1) % ZOOMS.length];
     const btn = $('[data-act="zoom"]', els.result);
     if (btn) btn.textContent = state.zoom === 0 ? '适应' : state.zoom + '%';
-    applyZoom();
+    layoutFrame();
   }
 
   function setRevision(i) {
@@ -482,21 +552,21 @@
     scrollToResult();
 
     try {
-      const planned = await api.plan({ roleId: state.roleId, requirement, ratio: state.ratio });
+      const planned = await api.plan({ roleId: state.roleId, requirement });
       state.record = planned.record;
       state.revIndex = -1;
       sessionStorage.setItem('hz.currentId', state.record.id);
 
-      setBusy(true, '生成视觉稿…');
-      renderLoading(1, '正在调用图像模型生成视觉稿…');
+      setBusy(true, '生成界面…');
+      renderLoading(1, '正在生成高保真界面…');
 
-      const rendered = await api.render({ id: state.record.id, ratio: state.ratio });
+      const rendered = await api.render({ id: state.record.id });
       adoptRecord(rendered.record);
 
       renderRecord();
-      ui.toast('视觉稿已生成', 'ok');
+      ui.toast('高保真界面已生成', 'ok');
     } catch (err) {
-      // 服务端不下发 imagePrompt，因此以 visiblePrompt 判断"已完成解析、只差出图"
+      // 服务端不下发 designBrief，因此以 visiblePrompt 判断"已完成解析、只差生成页面"
       const canPartial = !!(state.record && state.record.visiblePrompt);
       renderError(err, canPartial);
       ui.toast(api.friendly(err), 'err');
@@ -505,16 +575,15 @@
     }
   }
 
-  async function renderOnly(ratio) {
+  async function renderOnly() {
     if (state.busy || !state.record) return;
-    const target = ratio || state.record.ratio;
-    setBusy(true, '生成视觉稿…');
-    renderLoading(1, '正在调用图像模型生成视觉稿…');
+    setBusy(true, '生成界面…');
+    renderLoading(1, '正在按设计说明生成视觉稿…');
     try {
-      const rendered = await api.render({ id: state.record.id, ratio: target });
+      const rendered = await api.render({ id: state.record.id });
       adoptRecord(rendered.record);
       renderRecord();
-      ui.toast('视觉稿已生成', 'ok');
+      ui.toast('高保真界面已生成', 'ok');
     } catch (err) {
       renderError(err, true);
       ui.toast(api.friendly(err), 'err');
@@ -526,33 +595,6 @@
   async function retryLast() {
     if (state.record && state.record.visiblePrompt) return renderOnly();
     return generate();
-  }
-
-  async function switchRatio(ratio) {
-    if (state.busy) return;
-    state.ratio = ratio;
-    if (!state.record) { renderEmpty(); return; }
-
-    const revs = state.record.revisions || [];
-    // 只有解析结果、还没出图（上一次出图失败）时，切换比例等同于点「重新出图」
-    if (!revs.length) return renderOnly(ratio);
-
-    const atLatest = state.revIndex === revs.length - 1;
-    if (state.record.ratio === ratio && atLatest) return;
-
-    setBusy(true, '切换比例…');
-    renderLoading(1, '正在按 ' + ratio + ' 重新生成…');
-    try {
-      const r = await api.rerender({ id: state.record.id, ratio });
-      adoptRecord(r.record);
-      renderRecord();
-      ui.toast('已切换到 ' + ratio, 'ok');
-    } catch (err) {
-      renderRecord();
-      ui.toast(api.friendly(err), 'err');
-    } finally {
-      setBusy(false);
-    }
   }
 
   async function regenerate() {
@@ -587,7 +629,7 @@
       const r1 = await api.refine({ id: state.record.id, instruction });
       state.record = r1.record;              // 先留住最新对话，再出图
       renderLoading(1, '正在按新要求重绘…');
-      const r2 = await api.render({ id: state.record.id, ratio: state.record.ratio });
+      const r2 = await api.render({ id: state.record.id });
       adoptRecord(r2.record);
       renderRecord();
       ui.toast('已按你的要求更新', 'ok');
@@ -607,17 +649,22 @@
     ui.toast(ok ? '业务 Prompt 已复制到剪贴板' : '复制失败，请手动选择文本', ok ? 'ok' : 'err');
   }
 
+  /* 下载当前版本的 HTML 源文件：它是自包含单文件，双击即可在浏览器打开，
+     也可以在会议室投屏时直接用浏览器全屏展示。 */
   function downloadCurrent() {
     const rec = state.record;
     if (!rec) return;
     const revs = rec.revisions || [];
     const rev = revs[state.revIndex] || revs[revs.length - 1];
-    if (!rev || !rev.imageUrl) { ui.toast('暂无可下载的视觉稿', 'err'); return; }
+    if (!rev || !rev.html) { ui.toast('暂无可下载的页面', 'err'); return; }
 
     const safe = (rec.title || '视觉稿').replace(/[\\/:*?"<>|\s]+/g, '-').slice(0, 24);
-    const name = '绘职AI-' + rec.roleName + '-' + safe + '-' + rev.ratio.replace(':', 'x') + '.png';
-    ui.download(rev.imageUrl, name);
-    ui.toast('已开始下载', 'ok');
+    const name = '绘职AI-' + rec.roleName + '-' + safe + '-' + (rev.size || rev.ratio || 'view').replace(/[:\s]/g, '-') + '.html';
+    const blob = new Blob([rev.html], { type: 'text/html;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    ui.download(url, name);
+    setTimeout(() => URL.revokeObjectURL(url), 4000);
+    ui.toast('已开始下载 HTML 页面', 'ok');
   }
 
   /* ------------------------------------------------------------------ 滚动 */
@@ -634,20 +681,17 @@
         const data = await api.roles();
         if (data && data.roles && data.roles.length) {
           state.roles = data.roles;
-          if (data.ratios && data.ratios.length) state.ratios = data.ratios;
           if (!state.roles.some((r) => r.id === state.roleId)) state.roleId = state.roles[0].id;
         }
       } catch (_) { /* 保留 FALLBACK_ROLES */ }
     }
 
-    // 应用「设置」页保存的默认偏好
+    // 应用「设置」页保存的默认岗位偏好（画幅已改为由模型按需求自动适配）
     let prefs = {};
     try { prefs = JSON.parse(localStorage.getItem('hz.prefs') || '{}'); } catch (_) { prefs = {}; }
     if (prefs.roleId && state.roles.some((r) => r.id === prefs.roleId)) state.roleId = prefs.roleId;
 
-    state.ratio = (prefs.ratio && state.ratios.indexOf(prefs.ratio) >= 0)
-      ? prefs.ratio
-      : (roleById(state.roleId).defaultRatio || '16:9');
+    state.ratio = roleById(state.roleId).defaultRatio || '16:9';
 
     renderRoles();
     syncRoleUI();
@@ -662,7 +706,7 @@
     try {
       const data = await api.history();
       const rec = (data.records || []).filter((r) => r.id === id)[0];
-      if (!rec || !rec.imageUrl) return;
+      if (!rec || !rec.html) return;
       adoptRecord(rec);
       state.roleId = rec.roleId;
       state.ratio = rec.ratio;
@@ -698,6 +742,16 @@
 
   /* --------------------------------------------- 服务状态（纯展示，不阻塞） */
   /* 只负责告诉用户现在能不能用；任何一步失败都不影响已渲染好的界面。 */
+  /* 一次探测失败不等于服务挂了：后端跑长任务时是单线程，会被短暂占满。
+     因此重试 3 次，仍然失败才提示，并转入后台复查等待自愈。 */
+  async function probeHealth() {
+    for (let i = 0; i < 3; i++) {
+      try { return await api.health(4000); }
+      catch (_) { if (i < 2) await new Promise((r) => setTimeout(r, 1200)); }
+    }
+    return null;
+  }
+
   async function refreshStatus() {
     // 静态托管（如 GitHub Pages）没有后端：不做注定失败的探测，直接如实说明。
     // 界面与交互此时依然完全可用，不受影响。
@@ -710,24 +764,24 @@
       return;
     }
 
-    let h = null;
-    try { h = await api.health(); } catch (_) { h = null; }
+    const h = await probeHealth();
 
-    // 服务不可达：只做提示，界面本身继续可用
+    // 服务不可达：只做提示，界面本身继续可用；后台持续复查，恢复后自动刷新
     if (!h) {
       els.live.className = 'live is-off';
       els.liveText.textContent = '服务未连接';
       els.live.dataset.ready = '0';
-      ui.offlineBar('本地服务未响应，请先运行 <strong>start.ps1</strong> 后再刷新页面。');
+      ui.offlineBar('本地服务未响应，正在自动重试…（若长时间未恢复，请在本机运行 <strong>start.ps1</strong>）');
+      ui.watchBackend();
       return;
     }
 
     ui.clearOfflineBar();
 
-    const chat  = !!(h.chat  && h.chat.configured);
-    const image = !!(h.image && h.image.configured);
+    const chat    = !!(h.chat    && h.chat.configured);
+    const codegen = !!(h.codegen && h.codegen.configured);
 
-    if (chat && image) {
+    if (chat && codegen) {
       els.live.className = 'live is-on';
       els.liveText.textContent = 'AI Agent 在线';
       els.live.dataset.ready = '1';
@@ -763,6 +817,8 @@
     bindStatic();
 
     // 状态探测放在渲染之后；它自己会吞掉异常，不会影响上面已完成的部分
+    // 服务恢复后由 ui 统一回调，自动把状态刷回"在线"，无需用户手动刷新
+    ui.onBackendUp(refreshStatus);
     refreshStatus();
 
     loadRoles().then(restoreSession);
@@ -772,6 +828,10 @@
     document.addEventListener('visibilitychange', () => {
       if (!document.hidden) refreshStatus();
     });
+
+    // 画幅尺寸依赖容器大小，窗口变化与进出全屏时都要重新计算
+    window.addEventListener('resize', layoutFrame);
+    document.addEventListener('fullscreenchange', layoutFrame);
   }
 
   if (document.readyState === 'loading') {

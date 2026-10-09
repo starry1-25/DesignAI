@@ -8,14 +8,14 @@
 
   /* 超时必须覆盖服务端的完整重试预算，否则前端会先于后端放弃：
      用户看到"超时"，而服务端其实还在正常重试。
-     服务端预算 —— 文本：60s × 3 次 + (5s + 10s) 退避 ≈ 195s
-                   图像：75s × 2 次 + 5s 退避 + 75s（兜底模型）= 230s */
+     服务端预算 —— 文本（规划/微调）：60s × 3 次 + (5s + 10s) 退避 ≈ 195s
+                   页面生成：150s × 2 次 + 5s 退避 ≈ 305s
+                   重新生成 = 规划 + 页面生成 ≈ 500s */
   const TIMEOUT = {
     plan:       250000,
-    render:     290000,
-    rerender:   290000,
+    render:     320000,
     refine:     250000,
-    regenerate: 490000,
+    regenerate: 540000,
     short:       20000
   };
 
@@ -30,6 +30,7 @@
     no_api_key:          '服务端尚未配置 Agnes AI 密钥，请联系服务提供方。',
     plan_parse_failed:   '模型这次返回的内容无法解析，请点「重新生成」。',
     refine_parse_failed: '微调结果无法解析，换个说法再试一次。',
+    missing_brief:       '这条记录缺少设计说明，请重新生成。',
     not_found:           '这条记录已不存在，请刷新页面。',
     empty_requirement:   '请先描述你的需求。',
     empty_instruction:   '请输入你想调整的内容。',
@@ -136,13 +137,12 @@
     friendly,
     isSetupError,
 
-    health:     ()                  => get('/health', 8000),
+    health:     (timeoutMs)         => get('/health', timeoutMs || 8000),
     roles:      ()                  => get('/roles', 20000),
     history:    ()                  => get('/history', 30000),
     plan:       (payload)           => request('/plan', payload, TIMEOUT.plan),
     render:     (payload)           => request('/render', payload, TIMEOUT.render),
     refine:     (payload)           => request('/refine', payload, TIMEOUT.refine),
-    rerender:   (payload)           => request('/rerender', payload, TIMEOUT.rerender),
     regenerate: (payload)           => request('/regenerate', payload, TIMEOUT.regenerate),
     remove:     (id)                => del('/history?id=' + encodeURIComponent(id), 20000),
     clear:      ()                  => request('/history/clear', {}, 15000)

@@ -759,21 +759,45 @@ code {
 
 .canvas-viewport {
   display: flex;
-  align-items: center;
-  justify-content: center;
   overflow: auto;
-  max-height: 620px;
+  height: clamp(320px, 58vh, 620px);
   border-radius: var(--r-s);
 }
 
-.canvas-img {
-  display: block;
-  margin: 0 auto;
+/* 生成结果用原生 DOM 渲染：外层负责尺寸，内层沙箱 iframe 填满。
+   缩放只改盒子尺寸、不重采样像素，因此任意倍率都保持矢量级清晰。 */
+.frame-shell { margin: auto; flex: none; }
+
+.frame-fit {
+  position: relative;
+  overflow: hidden;
   border-radius: var(--r-s);
-  background: #fff;
-  box-shadow: 0 16px 44px -22px rgba(20, 20, 45, .55);
-  transition: transform var(--dur) var(--ease);
-  transform-origin: center center;
+  background: #0d1117;
+  box-shadow: 0 16px 44px -22px rgba(0, 0, 0, .75);
+}
+
+.canvas-frame {
+  display: block;
+  width: 100%;
+  height: 100%;
+  border: 0;
+  background: #0d1117;
+}
+
+/* 全屏展示（会议投屏）：深色底 + 居中等比铺满 */
+.frame-shell:fullscreen {
+  width: 100vw;
+  height: 100vh;
+  margin: 0;
+  background: #05050a;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.frame-shell:fullscreen .frame-fit {
+  border-radius: 0;
+  box-shadow: none;
 }
 
 .canvas-meta {
@@ -829,6 +853,7 @@ code {
   background: #f6f7fb;
   border-radius: 12px;
   padding: 14px;
+  margin: auto;
   min-height: 380px;
   font-size: 12px;
   color: #2b2b45;
@@ -1418,17 +1443,26 @@ code {
 }
 
 .hist-thumb {
+  position: relative;
   width: 100%;
   aspect-ratio: 16 / 10;
   border-radius: var(--r-s);
   overflow: hidden;
-  background: #eef0f6;
+  background: #0b0b16;
   border: 1px solid var(--line);
   display: grid;
   place-items: center;
 }
 
-.hist-thumb img { width: 100%; height: 100%; object-fit: contain; }
+.hist-thumb iframe {
+  position: absolute;
+  left: 0;
+  top: 0;
+  border: 0;
+  transform-origin: top left;
+  pointer-events: none;
+  background: #0d1117;
+}
 
 .hist-thumb .ph { color: #a9aec6; font-size: 11px; }
 
@@ -1524,7 +1558,25 @@ code {
   place-items: center;
 }
 
-.drawer-img img { max-width: 100%; max-height: 460px; object-fit: contain; }
+.drawer-frame {
+  position: relative;
+  width: 100%;
+  overflow: hidden;
+  border-radius: var(--r-m);
+  border: 1px solid var(--line);
+  background: #0d1117;
+  margin-bottom: 16px;
+}
+
+.drawer-frame iframe {
+  position: absolute;
+  left: 0;
+  top: 0;
+  border: 0;
+  transform-origin: top left;
+  pointer-events: none;
+  background: #0d1117;
+}
 
 .kv { display: flex; flex-direction: column; gap: 12px; margin-bottom: 18px; }
 
@@ -1753,7 +1805,7 @@ code {
 
   .canvas { padding: 12px; }
   .canvas-stage { padding: 10px; }
-  .canvas-viewport { max-height: 460px; }
+  .canvas-viewport { height: clamp(240px, 52vh, 460px); }
   .canvas-meta { left: 18px; bottom: 18px; }
   .canvas-zoom { right: 18px; bottom: 18px; }
   .meta-pill { height: 25px; font-size: 10.5px; padding: 0 9px; }
